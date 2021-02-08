@@ -22,6 +22,6 @@ envoy_dependency_imports()
 
 new_local_repository(
     name = "openssl",
-    path = "/usr/lib64/",
+    path = "/usr/lib/x86_64-linux-gnu/",
     build_file = "openssl.BUILD"
 )

@@ -46,6 +46,38 @@ int ContextImpl::sslExtendedSocketInfoIndex() {
   }());
 }
 
+absl::string_view openssl_curve_id_to_string(const int nid) {
+    const char* ec_curve = EC_curve_nid2nist(nid);
+    if (ec_curve != nullptr) {
+      return ec_curve;
+    }
+    const char* curve = OBJ_nid2sn(nid);
+    if (curve != NULL) {
+      return curve;
+    }
+    return "unknown";
+}
+
+// TODO(oschaaf): We only need to do this once.
+const std::vector<std::string> openssl_get_curve_names() {
+  std::vector<std::string> curves_vector; 
+	EC_builtin_curve* curves = NULL;
+	size_t i;
+	size_t len = EC_get_builtin_curves(NULL, 0);
+	curves = (EC_builtin_curve*)malloc(sizeof(EC_builtin_curve) * len);
+	if (EC_get_builtin_curves(curves, len)) {
+    for (i = 0; i < len; i++) {
+      curves_vector.emplace_back(openssl_curve_id_to_string(curves[i].nid));
+    }
+	}
+	free(curves);
+  return curves_vector;
+}
+
+void my_callback(const OBJ_NAME *obj,void* out) {
+  reinterpret_cast<std::vector<std::string>*>(out)->push_back(obj->name);
+}
+
 ContextImpl::ContextImpl(Stats::Scope& scope, const Envoy::Ssl::ContextConfig& config,
                          TimeSource& time_source)
     : scope_(scope), stats_(generateStats(scope)), time_source_(time_source),
@@ -398,20 +430,44 @@ ContextImpl::ContextImpl(Stats::Scope& scope, const Envoy::Ssl::ContextConfig& c
   // contention.
 
   // Ciphers
-  stat_name_set_->rememberBuiltin("AEAD-AES128-GCM-SHA256");
-  stat_name_set_->rememberBuiltin("ECDHE-ECDSA-AES128-GCM-SHA256");
-  stat_name_set_->rememberBuiltin("ECDHE-RSA-AES128-GCM-SHA256");
-  stat_name_set_->rememberBuiltin("ECDHE-RSA-AES128-SHA");
-  stat_name_set_->rememberBuiltin("ECDHE-RSA-CHACHA20-POLY1305");
-  stat_name_set_->rememberBuiltin("TLS_AES_128_GCM_SHA256");
+  const STACK_OF(SSL_CIPHER) *ciphers = SSL_CTX_get_ciphers(tls_context_.ssl_ctx_.get());
+  for (size_t i = 0; i < sk_SSL_CIPHER_num(ciphers); i++) {
+    const SSL_CIPHER *cipher = sk_SSL_CIPHER_value(ciphers, i);
+    std::cerr << "@@ reg cipher " << SSL_CIPHER_get_name(cipher) << std::endl;
+    stat_name_set_->rememberBuiltin(SSL_CIPHER_get_name(cipher));
+  }
 
-  // Curves from
-  // https://github.com/google/boringssl/blob/f4d8b969200f1ee2dd872ffb85802e6a0976afe7/ssl/ssl_key_share.cc#L384
-  stat_name_set_->rememberBuiltins(
-      {"P-224", "P-256", "P-384", "P-521", "X25519", "CECPQ2", "CECPQ2b"});
+  const std::vector<std::string> curves = openssl_get_curve_names();
+  for (const std::string& name : curves) {
+    std::cerr << "@@ reg curve " << name << std::endl;
+  }
+  stat_name_set_->rememberBuiltins(curves);
+
+  std::vector<std::string> object_names;
+  OpenSSL_add_all_digests(); //make sure they're loaded
+  OBJ_NAME_do_all(OBJ_NAME_TYPE_MD_METH, my_callback, reinterpret_cast<void*>(&object_names));
+  stat_name_set_->rememberBuiltins(object_names);
+
+  for (const std::string& name : object_names) {
+    std::cerr << "@@ reg alg " << name << std::endl;
+  }
 
   // Algorithms
-  stat_name_set_->rememberBuiltins({"ecdsa_secp256r1_sha256", "rsa_pss_rsae_sha256"});
+  stat_name_set_->rememberBuiltins({
+      "rsa_pkcs1_md5_sha1",
+      "rsa_pkcs1_sha1",
+      "rsa_pkcs1_sha256",
+      "rsa_pkcs1_sha384",
+      "rsa_pkcs1_sha512",
+      "ecdsa_sha1",
+      "ecdsa_secp256r1_sha256",
+      "ecdsa_secp384r1_sha384",
+      "ecdsa_secp521r1_sha512",
+      "rsa_pss_rsae_sha256",
+      "rsa_pss_rsae_sha384",
+      "rsa_pss_rsae_sha512",
+      "ed25519",
+  });
 
   // Versions
   stat_name_set_->rememberBuiltins({"TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"});
@@ -590,33 +646,29 @@ void ContextImpl::logHandshake(SSL* ssl) const {
   incCounter(ssl_ciphers_, SSL_get_cipher_name(ssl), unknown_ssl_cipher_);
   incCounter(ssl_versions_, SSL_get_version(ssl), unknown_ssl_version_);
 
-  //uint16_t curve_id = SSL_get_curve_id(ssl);
-  //if (curve_id) {
-  //  incCounter(ssl_curves_, SSL_get_curve_name(curve_id), unknown_ssl_curve_);
-  //}
   int group = SSL_get_shared_group(ssl, NULL);
   if (group > 0) {
-    switch (group) {
-      case NID_X25519:
-        incCounter(ssl_curves_, "X25519", unknown_ssl_curve_);
-        break;
-      case NID_X9_62_prime256v1:
-        incCounter(ssl_curves_, "P-256", unknown_ssl_curve_);
-        break;
-      default:
-        incCounter(ssl_curves_, "", unknown_ssl_curve_);
-        // case NID_secp384r1: {
-        //	scope_.counter(fmt::format("ssl.curves.{}", "P-384")).inc();
-        //} break;
-    }
+    absl::string_view curve = openssl_curve_id_to_string(group);
+    std::cerr << "## curve: " << curve << std::endl;
+    incCounter(ssl_curves_, curve, unknown_ssl_curve_);
   }
 
-  // TODO (dmitri-d) sort out ssl_sigalgs_ stats
-  //uint16_t sigalg_id = SSL_get_peer_signature_algorithm(ssl);
-  //if (sigalg_id) {
-  //  const char *sigalg = SSL_get_signature_algorithm_name(sigalg_id, 1 /* include curve */);
-  //  incCounter(ssl_sigalgs_, sigalg, unknown_ssl_algorithm_);
-  //}
+  int sigalg_id; 
+  if (SSL_get_peer_signature_type_nid(ssl, &sigalg_id) == 1) {
+    const char* sigalg = OBJ_nid2sn(sigalg_id);
+    std::cerr << "## sig alg: " << sigalg << std::endl;
+    int digest_id = 0;
+    int pkey_id  = 0;
+    if (OBJ_find_sigid_algs(sigalg_id, &digest_id, &pkey_id)){
+      std::cerr << "## sig alg split: " << digest_id << " - " << pkey_id << std::endl;
+      std::cerr << "## sig alg split: " << OBJ_nid2sn(digest_id) << " - " << OBJ_nid2sn(pkey_id) << std::endl;
+    } else {
+      std::cerr << "## sig alg split failure" << std::endl;
+    }
+    incCounter(ssl_sigalgs_, sigalg, unknown_ssl_algorithm_);
+  } else {
+    std::cerr << "## couldn't get sig alg." << std::endl;
+  }
 
   bssl::UniquePtr<X509> cert(SSL_get_peer_certificate(ssl));
   if (!cert.get()) {

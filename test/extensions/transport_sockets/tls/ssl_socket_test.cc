@@ -774,6 +774,15 @@ const std::string testUtilV2(const TestUtilOptionsV2& options) {
         << options.expectedServerStats();
   }
 
+  for (const auto& stat : server_stats_store.counters()) {
+    std::cerr << "server stat: " << stat->name() << ":" << stat->value() << std::endl;
+  }
+
+  for (const auto& stat : client_stats_store.counters()) {
+    std::cerr << "client stat: " << stat->name() << ":" << stat->value() << std::endl;
+  }
+
+
   if (!options.expectedClientStats().empty()) {
     EXPECT_EQ(1UL, client_stats_store.counter(options.expectedClientStats()).value());
   }
@@ -4227,6 +4236,41 @@ TEST_P(SslSocketTest, EcdhCurves) {
   server_params->add_cipher_suites("ECDHE-RSA-AES128-GCM-SHA256");
   testUtilV2(ecdh_curves_test_options);
   client_params->clear_ecdh_curves();
+  server_params->clear_cipher_suites();
+}
+
+
+TEST_P(SslSocketTest, MaistraDefaults) {
+  envoy::config::listener::v3::Listener listener;
+  envoy::config::listener::v3::FilterChain* filter_chain = listener.add_filter_chains();
+  envoy::extensions::transport_sockets::tls::v3::TlsCertificate* server_cert =
+      filter_chain->mutable_hidden_envoy_deprecated_tls_context()
+          ->mutable_common_tls_context()
+          ->add_tls_certificates();
+  server_cert->mutable_certificate_chain()->set_filename(TestEnvironment::substitute(
+      "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/san_dns_cert.pem"));
+  server_cert->mutable_private_key()->set_filename(TestEnvironment::substitute(
+      "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/san_dns_key.pem"));
+  envoy::extensions::transport_sockets::tls::v3::TlsParameters* server_params =
+      filter_chain->mutable_hidden_envoy_deprecated_tls_context()
+          ->mutable_common_tls_context()
+          ->mutable_tls_params();
+
+  envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext client;
+  envoy::extensions::transport_sockets::tls::v3::TlsParameters* client_params =
+      client.mutable_common_tls_context()->mutable_tls_params();
+
+  TestUtilOptionsV2 curves_test_options(listener, client, true, GetParam());
+  std::string stats = "ssl.curves.X25519";
+  curves_test_options.setExpectedServerStats(stats).setExpectedClientStats(stats);
+  testUtilV2(curves_test_options);
+
+  // Connection using defaults (client & server) succeeds.
+  TestUtilOptionsV2 test_options(listener, client, true, GetParam());
+
+  client_params->clear_ecdh_curves();
+  server_params->clear_ecdh_curves();
+  client_params->clear_cipher_suites();
   server_params->clear_cipher_suites();
 }
 
